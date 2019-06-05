@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-
 from protonets.models import register_model
 from .utils import euclidean_dist
 
@@ -12,16 +11,9 @@ import numpy as np
 
 from pyannote.audio.embedding.utils import to_condensed, pdist
 
-import logging
-# logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-sh = logging.StreamHandler()
-sh.setLevel(logging.DEBUG)
-sh.setFormatter(formatter)
-logger.addHandler(sh)
+from ..utils import log
+
+logger = log.setup_custom_logger(__name__)
 
 
 class FrameLevelEmbedding(nn.Module):
@@ -36,7 +28,7 @@ class FrameLevelEmbedding(nn.Module):
         self.conv_layers = nn.Sequential()
         pre_dim = input_feature_dim
         for i, (kernal_size, layer_size) in enumerate(zip(kernel_sizes, layer_sizes)):
-            self.conv_layers.add_module(f"conv_{i+1}",nn.Conv1d(pre_dim, layer_size, kernal_size))
+            self.conv_layers.add_module(f"conv_{i+1}",nn.Conv1d(pre_dim, layer_size, kernal_size, padding=kernal_size//2))
             self.conv_layers.add_module(f"relu_{i+1}", nn.ReLU())
             if i != len(kernel_sizes) - 1:
                 self.conv_layers.add_module(f"dropout_{i+1}", torch.nn.Dropout(self.dropout_keep_prob))
@@ -47,16 +39,28 @@ class FrameLevelEmbedding(nn.Module):
     def forward(self, x):
         # x: sequence of audio features, N * T * dim
         # output: sequence of hidden representation, N * T * hid
-        return self.conv_layers.forward(x.transpose(1,2)).transpose(1,2)
+        return self.conv_layers.forward(x.permute(0, 2, 1)).permute(0, 2, 1)
 
 class StatisticsPooling(nn.Module):
     def __init__(self):
         super(StatisticsPooling, self).__init__()
     
-    def forward(self, x):
-        h_mean = x.mean(dim=1)
-        h_std = x.std(dim=1)
-        return torch.cat([h_mean, h_std], 1)
+    def forward(self, x, lengths):
+        # x: batch * T * hid_dim
+        # lengths: batch * 1
+        x = x.cpu()
+        lengths = lengths.cpu()
+        lengths = lengths
+        h_mean = x.sum(dim=1) / lengths[:, None].float()
+
+        h_std = (x - h_mean[:, None, :])
+        mask = torch.arange(x.size(1))[None, :] < lengths[:, None].float()
+        mask = mask.float()
+        h_std = h_std * mask[:, :, None].expand(*mask.shape, h_std.shape[-1])
+        h_std = h_std ** 2
+        h_std = h_std.sum(dim=1) / lengths[:, None].float()
+        h_std = torch.sqrt(h_std)
+        return torch.cat([h_mean, h_std], 1).cuda()
 
 class TemoralAvgPooling(nn.Module):
     def __init__(self):
@@ -77,40 +81,18 @@ class UnitNormalize(nn.Module):
         norm = torch.norm(x, 2, 1, keepdim=True)
         return x / norm
 
-class FewShotSpeech(nn.Module):
-    def __init__(self, encoder_rnn, encoder_linear):
-        super(FewShotSpeech, self).__init__()
+class SpeechEmbeddingModel(nn.Module):
+    def __init__(self, seq_encoder, pooling_layer, linear_layers):
+        super(SpeechEmbeddingModel, self).__init__()
 
-        self.encoder_rnn = encoder_rnn
-        self.encoder_linear = encoder_linear
+        # self.seq_encoder = nn.DataParallel(seq_encoder)
+        # self.pooling_layer = nn.DataParallel(pooling_layer)
+        # self.linear_layers = nn.DataParallel(linear_layers)
 
-    def pdist(self, fX):
-        """Compute pdist à-la scipy.spatial.distance.pdist
+        self.seq_encoder = seq_encoder
+        self.pooling_layer = pooling_layer
+        self.linear_layers = linear_layers
 
-        Parameters
-        ----------
-        fX : (n, d) torch.Tensor
-            Embeddings.
-
-        Returns
-        -------
-        distances : (n * (n-1) / 2,) torch.Tensor
-            Condensed pairwise distance matrix
-        """
-
-        n_sequences, _ = fX.size()
-        distances = []
-
-        for i in range(n_sequences - 1):
-            d = 1. - F.cosine_similarity(
-                fX[i, :].expand(n_sequences - 1 - i, -1),
-                fX[i+1:, :], dim=1, eps=1e-8)
-
-            distances.append(d)
-
-        return torch.cat(distances)
-
-    
     # training with various length segmets 
     def loss(self, batch):
         xq = batch['xq_padded'] # n_class * n_query * max_len * mfcc_dim
@@ -139,22 +121,10 @@ class FewShotSpeech(nn.Module):
                         xq.view(n_class * n_query, *xq.size()[2:])],
                         0)
         
-        _len, perm_idx = seq_len.sort(0, descending=True)
+        x = self.seq_encoder.forward(x)
 
-        x = x[perm_idx]
-
-        packed_input = pack_padded_sequence(x, _len.cpu().numpy().astype(dtype=np.int32), batch_first=True)
-
-        packed_output, _ = self.encoder_rnn.forward(packed_input)
-
-        z, _ = pad_packed_sequence(packed_output, batch_first=True)
-
-        _, unperm_idx = perm_idx.sort(0)
-        z = z[unperm_idx]
-
-        #z, _ = self.encoder_rnn.forward(x)
-
-        z = self.encoder_linear.forward((z, seq_len))
+        z = self.pooling_layer.forward(x, seq_len)
+        z = self.linear_layers.forward(z)
 
         z_dim = z.size(-1)
         z_proto = z[:n_class*n_support].view(n_class, n_support, z_dim).mean(1)
@@ -185,25 +155,26 @@ class FewShotSpeech(nn.Module):
 def load_few_short_speech(**kwargs):
     # layer_sizes = [512, 512, 512, 512, 3 * 512]
     # kernel_sizes = [5, 5, 7, 1, 1]
-    # embedding_sizes = [512, 512]
+    # embedding_sizes = [512, 200], since in x-vector, after LDA, 200 dimension 
+    # is used for PLDA. Here we output the same dimension.
     layer_sizes = kwargs['layer_sizes']
     kernel_sizes = kwargs['kernel_sizes']
     embedding_sizes = kwargs['embedding_sizes']
 
     feature_dim = kwargs['feature_dim']
     dropout_keep_prob = kwargs['dropout_keep_prob']
+    seq_encoder = FrameLevelEmbedding(kernel_sizes, layer_sizes, feature_dim, dropout_keep_prob)
+    pooling_layer = StatisticsPooling()
 
-    encoder = nn.Sequential(
-            FrameLevelEmbedding(kernel_sizes, layer_sizes, feature_dim, dropout_keep_prob),
-            StatisticsPooling(),
-            # UnitNormalize()
-        )
+    linear_layers = nn.Sequential()
     pre_dim = layer_sizes[-1] * 2
     for i, emb_size in enumerate(embedding_sizes):
-        encoder.add_module(f"linear_{i+1}", nn.Linear(pre_dim, emb_size, bias=True))
-        encoder.add_module(f"linear_relu_{i+1}", nn.ReLU())
+        linear_layers.add_module(f"linear_{i+1}", nn.Linear(pre_dim, emb_size, bias=True))
+        linear_layers.add_module(f"linear_relu_{i+1}", nn.ReLU())
+        pre_dim = emb_size
 
         if i != len(embedding_sizes) - 1:
-            encoder.add_module(f"linear_dropout_{i+1}", torch.nn.Dropout(dropout_keep_prob))
+            linear_layers.add_module(f"linear_dropout_{i+1}", torch.nn.Dropout(dropout_keep_prob))
 
-    return encoder
+
+    return SpeechEmbeddingModel(seq_encoder, pooling_layer, linear_layers)

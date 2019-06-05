@@ -4,16 +4,22 @@ import numpy as np
 
 import logging
 
+loggers = {}
 def setup_custom_logger(name):
-    formatter = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
+    if name in loggers:
+        return loggers[name]
+    else:
+        formatter = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(module)s - %(message)s ')
 
-    handler = logging.StreamHandler()
-    handler.setFormatter(formatter)
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
 
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(handler)
-    return logger
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        
+        loggers[name] = logger
+        return logger
 
 def extract_meter_values(meters):
     ret = { }
